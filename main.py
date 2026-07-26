@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import ipaddress
 import socket
 import requests
@@ -83,7 +83,9 @@ def allow(result):
     return {
         "action": "allow",
         "reason": "ok",
-        "result": result,
+        "result": {
+            "content": result
+        },
     }
 
 
@@ -180,15 +182,11 @@ def fetch_guard(url: str):
     if parsed.username or parsed.password:
         return block("userinfo forbidden")
 
-    if parsed.fragment:
-        return block("fragment forbidden")
-
     host = parsed.hostname
-
     if not host:
         return block("missing host")
 
-    # Block literal IP addresses
+    # Block IP-literal hosts
     try:
         ipaddress.ip_address(host)
         return block("ip host forbidden")
@@ -198,9 +196,12 @@ def fetch_guard(url: str):
     if host not in ALLOWED_HOSTS:
         return block("host forbidden")
 
-    # Allow only default ports
-    if parsed.port not in (None, 80, 443):
-        return block("port forbidden")
+    # Allow only the default port for the scheme
+    if parsed.port is not None:
+        if parsed.scheme == "http" and parsed.port != 80:
+            return block("port forbidden")
+        if parsed.scheme == "https" and parsed.port != 443:
+            return block("port forbidden")
 
     if not validate_dns(host):
         return block("private address")
@@ -209,27 +210,51 @@ def fetch_guard(url: str):
         response = requests.get(
             url,
             timeout=5,
-            allow_redirects=True,
-            max_redirects=5,
+            allow_redirects=False,
         )
-    except requests.TooManyRedirects:
-        return block("too many redirects")
     except Exception:
         return block("fetch failed")
 
-    final = urlparse(response.url)
+    # Validate exactly one redirect if present
+    if response.is_redirect:
+        location = response.headers.get("Location")
+        if not location:
+            return block("bad redirect")
 
-    if final.hostname not in ALLOWED_HOSTS:
-        return block("redirect forbidden")
+        redirect_url = urljoin(url, location)
+        nxt = urlparse(redirect_url)
 
-    if final.port not in (None, 80, 443):
-        return block("redirect port forbidden")
+        if nxt.scheme not in ("http", "https"):
+            return block("redirect scheme")
 
-    if not validate_dns(final.hostname):
-        return block("redirect private")
+        if nxt.username or nxt.password:
+            return block("redirect userinfo")
+
+        if not nxt.hostname:
+            return block("redirect host")
+
+        if nxt.hostname not in ALLOWED_HOSTS:
+            return block("redirect forbidden")
+
+        if nxt.port is not None:
+            if nxt.scheme == "http" and nxt.port != 80:
+                return block("redirect port")
+            if nxt.scheme == "https" and nxt.port != 443:
+                return block("redirect port")
+
+        if not validate_dns(nxt.hostname):
+            return block("redirect private")
+
+        try:
+            response = requests.get(
+                redirect_url,
+                timeout=5,
+                allow_redirects=False,
+            )
+        except Exception:
+            return block("redirect failed")
 
     return allow(response.text)
-
 
 # --------------------------------------------------
 # API
