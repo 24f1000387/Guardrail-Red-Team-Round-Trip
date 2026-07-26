@@ -145,19 +145,30 @@ def validate_dns(host):
     except Exception:
         return False
 
+    if not infos:
+        return False
+
     for info in infos:
         ip = info[4][0]
 
         try:
-            if not ip_is_public(ip):
-                return False
-        except Exception:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
             return False
 
     return True
 
-
-def fetch_guard(url):
+def fetch_guard(url: str):
     try:
         parsed = urlparse(url)
     except Exception:
@@ -169,13 +180,27 @@ def fetch_guard(url):
     if parsed.username or parsed.password:
         return block("userinfo forbidden")
 
+    if parsed.fragment:
+        return block("fragment forbidden")
+
     host = parsed.hostname
 
     if not host:
-        return block("bad url")
+        return block("missing host")
+
+    # Block literal IP addresses
+    try:
+        ipaddress.ip_address(host)
+        return block("ip host forbidden")
+    except ValueError:
+        pass
 
     if host not in ALLOWED_HOSTS:
         return block("host forbidden")
+
+    # Allow only default ports
+    if parsed.port not in (None, 80, 443):
+        return block("port forbidden")
 
     if not validate_dns(host):
         return block("private address")
@@ -184,40 +209,24 @@ def fetch_guard(url):
         response = requests.get(
             url,
             timeout=5,
-            allow_redirects=False,
+            allow_redirects=True,
+            max_redirects=5,
         )
+    except requests.TooManyRedirects:
+        return block("too many redirects")
     except Exception:
         return block("fetch failed")
 
-    if response.is_redirect:
+    final = urlparse(response.url)
 
-        location = response.headers.get("Location")
+    if final.hostname not in ALLOWED_HOSTS:
+        return block("redirect forbidden")
 
-        if not location:
-            return block("redirect")
+    if final.port not in (None, 80, 443):
+        return block("redirect port forbidden")
 
-        nxt = urlparse(location)
-
-        if nxt.scheme not in ("http", "https"):
-            return block("redirect")
-
-        if nxt.username or nxt.password:
-            return block("redirect")
-
-        if nxt.hostname not in ALLOWED_HOSTS:
-            return block("redirect forbidden")
-
-        if not validate_dns(nxt.hostname):
-            return block("redirect private")
-
-        try:
-            response = requests.get(
-                location,
-                timeout=5,
-                allow_redirects=False,
-            )
-        except Exception:
-            return block("redirect failed")
+    if not validate_dns(final.hostname):
+        return block("redirect private")
 
     return allow(response.text)
 
