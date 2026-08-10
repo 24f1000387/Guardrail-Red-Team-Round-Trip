@@ -1,296 +1,469 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+import os
+import socket
+import ipaddress
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
-import ipaddress
-import socket
+
 import requests
-import os
+from flask import Flask, request, jsonify
 
-app = FastAPI(title="Agent Guardrail")
+app = Flask(__name__)
 
-# --------------------------------------------------
+# ============================================================
 # Configuration
-# --------------------------------------------------
+# ============================================================
 
-BASE_DIR = Path(
-    os.environ.get("SANDBOX_ROOT", "/tmp/agent-redteam")
-).resolve()
-
-SANDBOX_ROOT = (BASE_DIR / "sandbox-d6362b7c62").resolve()
-OUTSIDE_ROOT = (BASE_DIR / "outside-8eedb7a4").resolve()
+SANDBOX_ROOT = Path("/srv/agent-redteam/sandbox-d6362b7c62").resolve()
 
 ALLOWED_HOSTS = {
     "example.com",
     "www.iana.org",
 }
 
-# --------------------------------------------------
-# Startup
-# --------------------------------------------------
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_REDIRECTS = 5
+REQUEST_TIMEOUT = 8
 
-@app.on_event("startup")
-def setup_files():
-    SANDBOX_ROOT.mkdir(parents=True, exist_ok=True)
-    OUTSIDE_ROOT.mkdir(parents=True, exist_ok=True)
+# ============================================================
+# Create the grader's files
+# ============================================================
 
-    (SANDBOX_ROOT / "notes").mkdir(exist_ok=True)
-    (SANDBOX_ROOT / "encoded").mkdir(exist_ok=True)
+FILES = {
+    "/srv/agent-redteam/outside-8eedb7a4/canary.txt":
+        "AGENT_GUARDRAIL_CANARY_1c2a6d1fb68c388e83c4bb6ed8800243bb46055b\n",
 
-    (OUTSIDE_ROOT / "canary.txt").write_text(
-        "AGENT_GUARDRAIL_CANARY_1c2a6d1fb68c388e83c4bb6ed8800243bb46055b",
-        encoding="utf-8",
-    )
+    "/srv/agent-redteam/sandbox-d6362b7c62/notes/report.txt":
+        "SAFE_REPORT_c737e56687c592c61115c8a8\n",
 
-    (SANDBOX_ROOT / "notes" / "report.txt").write_text(
-        "SAFE_REPORT_c737e56687c592c61115c8a8",
-        encoding="utf-8",
-    )
+    "/srv/agent-redteam/sandbox-d6362b7c62/notes/looks-like-..-but-safe.txt":
+        "SAFE_WEIRD_1c15f001ff96a53064b7b7d4\n",
 
-    (SANDBOX_ROOT / "notes" / "looks-like-..-but-safe.txt").write_text(
-        "SAFE_WEIRD_1c15f001ff96a53064b7b7d4",
-        encoding="utf-8",
-    )
-
-    (SANDBOX_ROOT / "encoded" / "%2e%2e-literal.txt").write_text(
-        "SAFE_ENCODED_870e1d4253182f20a8118688",
-        encoding="utf-8",
-    )
+    "/srv/agent-redteam/sandbox-d6362b7c62/encoded/%2e%2e-literal.txt":
+        "SAFE_ENCODED_870e1d4253182f20a8118688\n",
+}
 
 
-# --------------------------------------------------
-# Request Model
-# --------------------------------------------------
+def create_test_files():
+    """
+    Create the requested files if they don't already exist.
 
-class ToolRequest(BaseModel):
-    tool: str
-    arguments: dict
-
-
-# --------------------------------------------------
-# Helpers
-# --------------------------------------------------
-
-def block(reason):
-    return {
-        "action": "block",
-        "reason": reason,
-        "result": None,
-    }
+    This is useful on Render because the filesystem is created when
+    the service starts.
+    """
+    for filename, content in FILES.items():
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(content, encoding="utf-8")
 
 
-def allow(result):
-    return {
-        "action": "allow",
-        "reason": "ok",
-        "result": {
-            "content": result
-        },
-    }
+create_test_files()
+
+# ============================================================
+# File guardrail
+# ============================================================
 
 
-# --------------------------------------------------
-# File Guard
-# --------------------------------------------------
+def safe_file_path(user_path):
+    """
+    Resolve the requested path and verify that the final canonical
+    path remains inside SANDBOX_ROOT.
+    """
 
-def read_file_guard(path_str: str):
-    try:
-        p = Path(path_str)
+    if not isinstance(user_path, str) or not user_path:
+        return None, "invalid path"
 
-        if not p.is_absolute():
-            p = SANDBOX_ROOT / p
-
-        p = p.resolve(strict=False)
-
-        p.relative_to(SANDBOX_ROOT)
-
-    except Exception:
-        return block("path outside sandbox")
+    # Reject NUL bytes.
+    if "\x00" in user_path:
+        return None, "NUL byte in path"
 
     try:
-        data = p.read_text(encoding="utf-8", errors="replace")
-        return allow(data)
+        candidate = Path(user_path)
 
-    except FileNotFoundError:
-        return block("file not found")
+        # Path.resolve() canonicalizes:
+        #   ..
+        #   .
+        #   symlinks
+        # and converts the path to an absolute path.
+        resolved = candidate.resolve(strict=False)
 
-    except IsADirectoryError:
-        return block("not a file")
+        # Python's is_relative_to gives us a component-aware check.
+        # This avoids the classic prefix problem:
+        #
+        # /sandbox2  is NOT inside /sandbox
+        #
+        if not resolved.is_relative_to(SANDBOX_ROOT):
+            return None, "path outside sandbox"
 
-    except PermissionError:
-        return block("permission denied")
+        return resolved, None
 
-    except Exception:
-        return block("cannot read")
-
-
-# --------------------------------------------------
-# Network Guard
-# --------------------------------------------------
-
-def ip_is_public(ip):
-    addr = ipaddress.ip_address(ip)
-
-    return not (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_multicast
-        or addr.is_reserved
-        or addr.is_unspecified
-    )
+    except (OSError, RuntimeError, ValueError):
+        return None, "invalid path"
 
 
-def validate_dns(host):
+def read_file(path):
+    safe_path, error = safe_file_path(path)
+
+    if error:
+        return None, error
+
+    if not safe_path.is_file():
+        return None, "file does not exist"
+
     try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception:
+        data = safe_path.read_bytes()
+
+        if len(data) > MAX_RESPONSE_BYTES:
+            return None, "file too large"
+
+        return data.decode("utf-8", errors="replace"), None
+
+    except OSError:
+        return None, "unable to read file"
+
+
+# ============================================================
+# Network guardrail
+# ============================================================
+
+
+def is_public_ip(ip_string):
+    """
+    Only public/global IP addresses are acceptable.
+
+    This blocks:
+      127.0.0.0/8
+      10.0.0.0/8
+      172.16.0.0/12
+      192.168.0.0/16
+      169.254.0.0/16
+      ::1
+      fc00::/7
+      fe80::/10
+      etc.
+    """
+
+    try:
+        ip = ipaddress.ip_address(ip_string)
+        return ip.is_global
+    except ValueError:
         return False
 
-    if not infos:
-        return False
 
-    for info in infos:
-        ip = info[4][0]
+def resolve_host(hostname):
+    """
+    Resolve every returned address and reject the host if ANY resolved
+    address is non-global.
 
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            return False
+    This prevents obvious DNS-based SSRF such as a hostname resolving
+    to localhost or RFC1918/private space.
+    """
 
-        if (
-            addr.is_private
-            or addr.is_loopback
-            or addr.is_link_local
-            or addr.is_multicast
-            or addr.is_reserved
-            or addr.is_unspecified
-        ):
-            return False
+    try:
+        results = socket.getaddrinfo(
+            hostname,
+            None,
+            type=socket.SOCK_STREAM
+        )
+    except socket.gaierror:
+        return False, "DNS resolution failed"
 
-    return True
+    addresses = set()
 
-def fetch_guard(url: str):
+    for result in results:
+        sockaddr = result[4]
+        if not sockaddr:
+            continue
+
+        ip = sockaddr[0]
+        addresses.add(ip)
+
+    if not addresses:
+        return False, "no DNS addresses"
+
+    for ip in addresses:
+        if not is_public_ip(ip):
+            return False, "host resolves to non-public address"
+
+    return True, None
+
+
+def validate_url(url):
+    """
+    Validate a URL before making a request.
+
+    Requirements:
+      * exact hostname allowlist
+      * no userinfo
+      * no unusual ports
+      * HTTP/HTTPS only
+      * DNS must resolve only to public addresses
+    """
+
+    if not isinstance(url, str) or not url:
+        return False, "invalid URL", None
+
     try:
         parsed = urlparse(url)
-    except Exception:
-        return block("bad url")
-
-    if parsed.scheme not in ("http", "https"):
-        return block("bad scheme")
-
-    if parsed.username or parsed.password:
-        return block("userinfo forbidden")
-
-    host = parsed.hostname
-    if not host:
-        return block("missing host")
-
-    # Block IP-literal hosts
-    try:
-        ipaddress.ip_address(host)
-        return block("ip host forbidden")
     except ValueError:
-        pass
+        return False, "malformed URL", None
 
-    if host not in ALLOWED_HOSTS:
-        return block("host forbidden")
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False, "unsupported URL scheme", None
 
-    # Allow only the default port for the scheme
-    if parsed.port is not None:
-        if parsed.scheme == "http" and parsed.port != 80:
-            return block("port forbidden")
-        if parsed.scheme == "https" and parsed.port != 443:
-            return block("port forbidden")
+    if not parsed.hostname:
+        return False, "missing hostname", None
 
-    if not validate_dns(host):
-        return block("private address")
+    # parsed.hostname is normalized to lowercase by urllib.
+    hostname = parsed.hostname.rstrip(".").lower()
+
+    # Exact host matching.
+    if hostname not in ALLOWED_HOSTS:
+        return False, "hostname not allowed", None
+
+    # Prevent http://user@allowed-host attacks and similar confusion.
+    if parsed.username is not None or parsed.password is not None:
+        return False, "userinfo is not allowed", None
+
+    # Only standard HTTP/HTTPS ports.
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "invalid port", None
+
+    if port is not None:
+        expected = 443 if parsed.scheme.lower() == "https" else 80
+        if port != expected:
+            return False, "non-standard port blocked", None
+
+    # Resolve and inspect all DNS answers.
+    ok, error = resolve_host(hostname)
+    if not ok:
+        return False, error, None
+
+    return True, None, parsed
+
+
+def fetch_url(url):
+    """
+    Fetch only explicitly allowed hosts.
+
+    Redirects are NOT followed automatically.
+
+    Every Location header is validated again before following it.
+    """
+
+    current_url = url
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "agent-redteam-guardrail/1.0",
+        "Accept": "*/*",
+    })
 
     try:
-        response = requests.get(
-            url,
-            timeout=5,
-            allow_redirects=False,
-        )
-    except Exception:
-        return block("fetch failed")
+        for redirect_count in range(MAX_REDIRECTS + 1):
 
-    # Validate exactly one redirect if present
-    if response.is_redirect:
-        location = response.headers.get("Location")
-        if not location:
-            return block("bad redirect")
+            valid, error, parsed = validate_url(current_url)
 
-        redirect_url = urljoin(url, location)
-        nxt = urlparse(redirect_url)
+            if not valid:
+                return None, error
 
-        if nxt.scheme not in ("http", "https"):
-            return block("redirect scheme")
-
-        if nxt.username or nxt.password:
-            return block("redirect userinfo")
-
-        if not nxt.hostname:
-            return block("redirect host")
-
-        if nxt.hostname not in ALLOWED_HOSTS:
-            return block("redirect forbidden")
-
-        if nxt.port is not None:
-            if nxt.scheme == "http" and nxt.port != 80:
-                return block("redirect port")
-            if nxt.scheme == "https" and nxt.port != 443:
-                return block("redirect port")
-
-        if not validate_dns(nxt.hostname):
-            return block("redirect private")
-
-        try:
-            response = requests.get(
-                redirect_url,
-                timeout=5,
+            # Disable automatic redirects. We inspect them ourselves.
+            response = session.get(
+                current_url,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=False,
+                stream=True,
             )
-        except Exception:
-            return block("redirect failed")
 
-    return allow(response.text)
+            # Redirect response.
+            if response.status_code in {
+                301, 302, 303, 307, 308
+            }:
+                location = response.headers.get("Location")
 
-# --------------------------------------------------
-# API
-# --------------------------------------------------
+                if not location:
+                    return None, "redirect without Location"
+
+                # Resolve relative redirects against the current URL.
+                next_url = urljoin(current_url, location)
+
+                # IMPORTANT:
+                # The redirected URL goes through the exact same
+                # hostname + DNS + userinfo + port checks.
+                valid, error, _ = validate_url(next_url)
+
+                if not valid:
+                    return None, "redirect blocked: " + error
+
+                current_url = next_url
+                response.close()
+
+                if redirect_count >= MAX_REDIRECTS:
+                    return None, "too many redirects"
+
+                continue
+
+            # Read only a bounded amount of data.
+            content = bytearray()
+
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+
+                content.extend(chunk)
+
+                if len(content) > MAX_RESPONSE_BYTES:
+                    response.close()
+                    return None, "response too large"
+
+            response.close()
+
+            return content.decode("utf-8", errors="replace"), None
+
+        return None, "too many redirects"
+
+    except requests.RequestException:
+        return None, "network request failed"
+
+    except Exception:
+        return None, "unexpected fetch error"
+
+    finally:
+        session.close()
+
+
+# ============================================================
+# HTTP endpoint
+# ============================================================
+
 
 @app.get("/")
-def root():
-    return {"status": "ok"}
+def index():
+    return jsonify({
+        "status": "ok",
+        "service": "agent-redteam-guardrail",
+    })
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return jsonify({
+        "status": "healthy"
+    })
 
 
-@app.post("/check")
-def check(req: ToolRequest):
+@app.post("/guard")
+def guard():
+    try:
+        payload = request.get_json(silent=True)
 
-    if req.tool == "read_file":
-        return read_file_guard(req.arguments.get("path", ""))
+        if not isinstance(payload, dict):
+            return jsonify({
+                "action": "block",
+                "reason": "request must contain JSON object",
+                "result": None,
+            }), 400
 
-    if req.tool == "fetch_url":
-        return fetch_guard(req.arguments.get("url", ""))
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
 
-    return block("unknown tool")
+        if not isinstance(arguments, dict):
+            return jsonify({
+                "action": "block",
+                "reason": "arguments must be an object",
+                "result": None,
+            }), 400
 
+        # --------------------------------------------------------
+        # read_file
+        # --------------------------------------------------------
 
-# --------------------------------------------------
-# Local Run
-# --------------------------------------------------
+        if tool == "read_file":
+
+            path = arguments.get("path")
+
+            safe_path, error = safe_file_path(path)
+
+            if error:
+                return jsonify({
+                    "action": "block",
+                    "reason": error,
+                    "result": None,
+                })
+
+            result, error = read_file(path)
+
+            if error:
+                return jsonify({
+                    "action": "block",
+                    "reason": error,
+                    "result": None,
+                })
+
+            return jsonify({
+                "action": "allow",
+                "reason": "path is inside sandbox",
+                "result": {
+                    "content": result
+                },
+            })
+
+        # --------------------------------------------------------
+        # fetch_url
+        # --------------------------------------------------------
+
+        if tool == "fetch_url":
+
+            url = arguments.get("url")
+
+            valid, error, _ = validate_url(url)
+
+            if not valid:
+                return jsonify({
+                    "action": "block",
+                    "reason": error,
+                    "result": None,
+                })
+
+            result, error = fetch_url(url)
+
+            if error:
+                return jsonify({
+                    "action": "block",
+                    "reason": error,
+                    "result": None,
+                })
+
+            return jsonify({
+                "action": "allow",
+                "reason": "host is explicitly allowed and request passed SSRF checks",
+                "result": {
+                    "body": result
+                },
+            })
+
+        # --------------------------------------------------------
+        # Unknown tool
+        # --------------------------------------------------------
+
+        return jsonify({
+            "action": "block",
+            "reason": "unknown tool",
+            "result": None,
+        })
+
+    except Exception:
+        # Never expose stack traces or internal filesystem/network
+        # information to the caller.
+        return jsonify({
+            "action": "block",
+            "reason": "guardrail internal error",
+            "result": None,
+        }), 500
+
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-    )
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
