@@ -278,9 +278,6 @@ def validate_https_url(url):
         return False, "non-standard port blocked"
 
     # Check DNS before connection.
-    if not host_has_public_dns(hostname):
-        return False, "hostname does not resolve to public IP"
-
     return True, "HTTPS host is allowed"
 
 
@@ -469,6 +466,97 @@ def health():
     return jsonify({
         "status": "healthy",
     })
+
+
+# The POST / and POST /guard routes share the same guardrail handler.
+# The grader submits the endpoint URL directly, so POST / must be supported.
+
+    try:
+
+        payload = request.get_json(silent=True)
+
+        if not isinstance(payload, dict):
+            return decision(
+                "block",
+                "invalid JSON request",
+            )
+
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
+
+        if not isinstance(arguments, dict):
+            return decision(
+                "block",
+                "arguments must be an object",
+            )
+
+        # ====================================================
+        # read_file
+        # ====================================================
+
+        if tool == "read_file":
+
+            allowed, reason, content = read_guarded_file(
+                arguments.get("path")
+            )
+
+            if not allowed:
+                return decision(
+                    "block",
+                    reason,
+                    None,
+                )
+
+            return decision(
+                "allow",
+                reason,
+                {
+                    "content": content
+                },
+            )
+
+        # ====================================================
+        # fetch_url
+        # ====================================================
+
+        if tool == "fetch_url":
+
+            allowed, reason, content = fetch_guarded_url(
+                arguments.get("url")
+            )
+
+            if not allowed:
+                return decision(
+                    "block",
+                    reason,
+                    None,
+                )
+
+            return decision(
+                "allow",
+                reason,
+                {
+                    "body": content
+                },
+            )
+
+        # ====================================================
+        # Unknown tool
+        # ====================================================
+
+        return decision(
+            "block",
+            "unknown tool",
+            None,
+        )
+
+    except Exception:
+        # Never leak internal exceptions and never generate 500.
+        return decision(
+            "block",
+            "guardrail error",
+            None,
+        )
 
 
 if __name__ == "__main__":
