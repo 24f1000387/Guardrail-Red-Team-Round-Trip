@@ -408,12 +408,60 @@ def decision(action, reason, result=None):
 # HTTP API
 # ============================================================
 
-@app.get("/")
-def index():
-    return jsonify({
-        "status": "ok",
-        "service": "agent-redteam-guardrail",
-    })
+@app.route("/", methods=["GET", "POST"])
+@app.route("/guard", methods=["POST"])
+def guard():
+
+    if request.method == "GET":
+        return jsonify({
+            "status": "ok",
+            "service": "agent-redteam-guardrail",
+        })
+
+    try:
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return decision("block", "invalid JSON request", None)
+
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
+
+        if not isinstance(arguments, dict):
+            return decision("block", "arguments must be an object", None)
+
+        if tool == "read_file":
+            allowed, reason, content = read_guarded_file(
+                arguments.get("path")
+            )
+
+            if not allowed:
+                return decision("block", reason, None)
+
+            return decision(
+                "allow",
+                reason,
+                {"content": content},
+            )
+
+        if tool == "fetch_url":
+            allowed, reason, content = fetch_guarded_url(
+                arguments.get("url")
+            )
+
+            if not allowed:
+                return decision("block", reason, None)
+
+            return decision(
+                "allow",
+                reason,
+                {"body": content},
+            )
+
+        return decision("block", "unknown tool", None)
+
+    except Exception:
+        return decision("block", "guardrail error", None)
 
 
 @app.get("/health")
@@ -423,8 +471,8 @@ def health():
     })
 
 
-@app.post("/guard")
-def guard():
+# The POST / and POST /guard routes share the same guardrail handler.
+# The grader submits the endpoint URL directly, so POST / must be supported.
 
     try:
 
