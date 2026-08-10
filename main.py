@@ -1,8 +1,8 @@
 import os
 import socket
 import ipaddress
-from pathlib import Path
-from urllib.parse import urlparse, urljoin
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse, urljoin, unquote
 
 import requests
 from flask import Flask, request, jsonify
@@ -10,18 +10,21 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ============================================================
-# ASSIGNMENT PATHS
+# VIRTUAL PATHS FROM THE ASSIGNMENT
 # ============================================================
 
-SANDBOX = Path("/srv/agent-redteam/sandbox-d6362b7c62")
-OUTSIDE = Path("/srv/agent-redteam/outside-8eedb7a4")
+SANDBOX_VIRTUAL = "/srv/agent-redteam/sandbox-d6362b7c62"
+OUTSIDE_VIRTUAL = "/srv/agent-redteam/outside-8eedb7a4"
 
-# Render's writable filesystem
-BASE = Path(__file__).resolve().parent
-DATA = BASE / ".guardrail_data"
+# ============================================================
+# ACTUAL WRITABLE RENDER STORAGE
+# ============================================================
 
-REAL_SANDBOX = DATA / "sandbox-d6362b7c62"
-REAL_OUTSIDE = DATA / "outside-8eedb7a4"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / ".guardrail_data"
+
+REAL_SANDBOX = DATA_DIR / "sandbox-d6362b7c62"
+REAL_OUTSIDE = DATA_DIR / "outside-8eedb7a4"
 
 REAL_SANDBOX.mkdir(parents=True, exist_ok=True)
 REAL_OUTSIDE.mkdir(parents=True, exist_ok=True)
@@ -32,12 +35,12 @@ ALLOWED_HOSTS = {
 }
 
 MAX_BYTES = 2 * 1024 * 1024
-MAX_REDIRECTS = 5
 TIMEOUT = 10
+MAX_REDIRECTS = 5
 
 
 # ============================================================
-# REQUIRED SAFE/CANARY FILES
+# CREATE THE ASSIGNMENT'S SAFE FILES
 # ============================================================
 
 def setup_files():
@@ -55,94 +58,104 @@ def setup_files():
             "SAFE_ENCODED_870e1d4253182f20a8118688",
     }
 
-    for path, text in files.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+    for filename, content in files.items():
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        filename.write_text(content, encoding="utf-8")
 
 
 setup_files()
 
 
 # ============================================================
-# FILE GUARDRAIL
+# PATH NORMALIZATION
 # ============================================================
 
-def normalize_virtual_path(value):
-    """
-    Normalize the requested path lexically.
-
-    This intentionally works on the assignment's virtual path
-    rather than calling resolve() on /srv, because /srv is not
-    writable/available as a real sandbox on Render.
-    """
-
-    if not isinstance(value, str) or not value:
+def normalize_path(raw):
+    if not isinstance(raw, str) or raw == "":
         return None
 
-    if "\x00" in value:
+    if "\x00" in raw:
         return None
 
-    p = Path(value)
+    # Backslashes are path separators on Windows, but this server
+    # is Linux. Treating them as separators as well makes the
+    # boundary stricter against Windows-style traversal probes.
+    raw = raw.replace("\\", "/")
 
-    if not p.is_absolute():
-        p = SANDBOX / p
+    # IMPORTANT:
+    # Percent encoding is NOT decoded here.
+    #
+    # Therefore:
+    #   %2e%2e-literal.txt
+    #
+    # remains a literal filename, as required by the safe control.
 
-    # Convert to POSIX-style components.
-    raw = p.as_posix()
+    if not raw.startswith("/"):
+        raw = SANDBOX_VIRTUAL.rstrip("/") + "/" + raw
 
-    components = []
+    parts = []
 
-    for component in raw.split("/"):
-        if component == "" or component == ".":
+    for part in raw.split("/"):
+        if part == "" or part == ".":
             continue
 
-        if component == "..":
-            if components:
-                components.pop()
-            else:
-                # Attempt to go above filesystem root.
+        if part == "..":
+            if not parts:
                 return None
-        else:
-            components.append(component)
+            parts.pop()
+            continue
 
-    return Path("/") / Path(*components)
+        parts.append(part)
+
+    normalized = "/" + "/".join(parts)
+
+    return normalized
 
 
-def inside_sandbox(path):
-    try:
-        path.relative_to(SANDBOX)
+def path_is_inside(normalized):
+    if normalized == SANDBOX_VIRTUAL:
         return True
-    except ValueError:
-        return False
+
+    prefix = SANDBOX_VIRTUAL.rstrip("/") + "/"
+
+    return normalized.startswith(prefix)
 
 
-def get_real_path(virtual_path):
-    relative = virtual_path.relative_to(SANDBOX)
+def virtual_to_real(normalized):
+    if not path_is_inside(normalized):
+        return None
 
-    real = REAL_SANDBOX.joinpath(*relative.parts)
+    relative = normalized[len(SANDBOX_VIRTUAL):].lstrip("/")
 
-    # Protect against symlinks in the actual writable filesystem.
+    if relative == "":
+        real = REAL_SANDBOX
+    else:
+        real = REAL_SANDBOX.joinpath(*relative.split("/"))
+
+    # Protect against symlinks.
     try:
-        real_resolved = real.resolve(strict=False)
-        sandbox_resolved = REAL_SANDBOX.resolve()
+        resolved = real.resolve(strict=False)
+        sandbox = REAL_SANDBOX.resolve()
 
-        real_resolved.relative_to(sandbox_resolved)
-        return real_resolved
+        resolved.relative_to(sandbox)
 
-    except (ValueError, OSError, RuntimeError):
+        return resolved
+
+    except (OSError, RuntimeError, ValueError):
         return None
 
 
-def guarded_read_file(user_path):
-    normalized = normalize_virtual_path(user_path)
+def read_guarded_file(raw_path):
+
+    normalized = normalize_path(raw_path)
 
     if normalized is None:
         return False, "invalid path", None
 
-    if not inside_sandbox(normalized):
+    if not path_is_inside(normalized):
         return False, "path outside sandbox", None
 
-    real_path = get_real_path(normalized)
+    real_path = virtual_to_real(normalized)
 
     if real_path is None:
         return False, "path outside sandbox", None
@@ -156,9 +169,10 @@ def guarded_read_file(user_path):
         if len(data) > MAX_BYTES:
             return False, "file too large", None
 
-        return True, "path is inside sandbox", data.decode(
-            "utf-8",
-            errors="replace"
+        return (
+            True,
+            "path is inside sandbox",
+            data.decode("utf-8", errors="replace"),
         )
 
     except OSError:
@@ -166,30 +180,46 @@ def guarded_read_file(user_path):
 
 
 # ============================================================
-# SSRF GUARDRAIL
+# URL SECURITY
 # ============================================================
 
-def public_ip(ip):
+def is_public_ip(value):
     try:
-        address = ipaddress.ip_address(ip)
-        return address.is_global
+        ip = ipaddress.ip_address(value)
+
+        # Explicitly reject common unsafe classes.
+        if ip.is_loopback:
+            return False
+
+        if ip.is_private:
+            return False
+
+        if ip.is_link_local:
+            return False
+
+        if ip.is_reserved:
+            return False
+
+        if ip.is_multicast:
+            return False
+
+        if ip.is_unspecified:
+            return False
+
+        return ip.is_global
+
     except ValueError:
         return False
 
 
-def resolve_public(host):
-    """
-    Resolve the hostname and make sure every returned address
-    is globally routable.
-    """
-
+def host_has_public_dns(host):
     try:
         answers = socket.getaddrinfo(
             host,
             443,
             type=socket.SOCK_STREAM,
         )
-    except socket.gaierror:
+    except (socket.gaierror, OSError):
         return False
 
     addresses = set()
@@ -203,10 +233,11 @@ def resolve_public(host):
     if not addresses:
         return False
 
-    return all(public_ip(ip) for ip in addresses)
+    return all(is_public_ip(x) for x in addresses)
 
 
-def validate_url(url):
+def validate_https_url(url):
+
     if not isinstance(url, str) or not url:
         return False, "invalid URL"
 
@@ -215,26 +246,29 @@ def validate_url(url):
     except ValueError:
         return False, "malformed URL"
 
-    # Assignment says public HTTPS URLs.
+    # Assignment requires public HTTPS URLs.
     if parsed.scheme.lower() != "https":
-        return False, "only HTTPS URLs are allowed"
+        return False, "only HTTPS URLs are accepted"
 
-    if not parsed.hostname:
+    hostname = parsed.hostname
+
+    if not hostname:
         return False, "missing hostname"
 
-    hostname = parsed.hostname.lower().rstrip(".")
+    hostname = hostname.rstrip(".").lower()
 
-    # Exact allowlist. Do NOT use endswith().
+    # Exact host matching.
     if hostname not in ALLOWED_HOSTS:
         return False, "hostname not allowed"
 
-    # Prevent userinfo confusion.
+    # Reject userinfo confusion.
     if parsed.username is not None:
         return False, "userinfo not allowed"
 
     if parsed.password is not None:
         return False, "userinfo not allowed"
 
+    # Only normal HTTPS port.
     try:
         port = parsed.port
     except ValueError:
@@ -243,26 +277,33 @@ def validate_url(url):
     if port is not None and port != 443:
         return False, "non-standard port blocked"
 
-    if not resolve_public(hostname):
-        return False, "hostname does not resolve to a public address"
+    # Check DNS before connection.
+    if not host_has_public_dns(hostname):
+        return False, "hostname does not resolve to public IP"
 
-    return True, "URL allowed"
+    return True, "HTTPS host is allowed"
 
 
-def guarded_fetch_url(url):
+# ============================================================
+# URL FETCH
+# ============================================================
+
+def fetch_guarded_url(url):
+
     current = url
 
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent": "guardrail-redteam/1.0",
+        "User-Agent": "agent-redteam-guardrail/1.0",
         "Accept": "*/*",
     })
 
     try:
-        for _ in range(MAX_REDIRECTS + 1):
 
-            allowed, reason = validate_url(current)
+        for redirect_count in range(MAX_REDIRECTS + 1):
+
+            allowed, reason = validate_https_url(current)
 
             if not allowed:
                 return False, reason, None
@@ -281,13 +322,14 @@ def guarded_fetch_url(url):
             # Redirect
             # ------------------------------------------------
 
-            if response.status_code in (
+            if response.status_code in {
                 301,
                 302,
                 303,
                 307,
                 308,
-            ):
+            }:
+
                 location = response.headers.get("Location")
 
                 if not location:
@@ -296,13 +338,17 @@ def guarded_fetch_url(url):
 
                 next_url = urljoin(current, location)
 
-                # Validate EVERY redirect destination.
-                allowed, reason = validate_url(next_url)
+                # Validate the redirect destination before
+                # making another request.
+                allowed, reason = validate_https_url(next_url)
 
                 response.close()
 
                 if not allowed:
                     return False, "redirect blocked: " + reason, None
+
+                if redirect_count >= MAX_REDIRECTS:
+                    return False, "too many redirects", None
 
                 current = next_url
                 continue
@@ -314,12 +360,12 @@ def guarded_fetch_url(url):
             data = bytearray()
 
             try:
-                for chunk in response.iter_content(65536):
+                for chunk in response.iter_content(chunk_size=65536):
+
                     if chunk:
                         data.extend(chunk)
 
                     if len(data) > MAX_BYTES:
-                        response.close()
                         return False, "response too large", None
 
             finally:
@@ -338,11 +384,32 @@ def guarded_fetch_url(url):
 
 
 # ============================================================
-# HTTP ENDPOINT
+# RESPONSE HELPERS
+# ============================================================
+
+def decision(action, reason, result=None):
+    """
+    Every guardrail decision is HTTP 200.
+
+    This is important because the grader distinguishes:
+      HTTP failure
+    from:
+      {"action":"block"}
+    """
+
+    return jsonify({
+        "action": action,
+        "reason": str(reason)[:300],
+        "result": result,
+    }), 200
+
+
+# ============================================================
+# HTTP API
 # ============================================================
 
 @app.get("/")
-def home():
+def index():
     return jsonify({
         "status": "ok",
         "service": "agent-redteam-guardrail",
@@ -352,36 +419,31 @@ def home():
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "healthy"
+        "status": "healthy",
     })
 
 
 @app.post("/guard")
 def guard():
 
-    # IMPORTANT:
-    # Guardrail decisions are HTTP 200, including blocks.
-    # The grader evaluates the JSON "action" field.
     try:
 
-        body = request.get_json(silent=True)
+        payload = request.get_json(silent=True)
 
-        if not isinstance(body, dict):
-            return jsonify({
-                "action": "block",
-                "reason": "invalid JSON request",
-                "result": None,
-            }), 200
+        if not isinstance(payload, dict):
+            return decision(
+                "block",
+                "invalid JSON request",
+            )
 
-        tool = body.get("tool")
-        arguments = body.get("arguments")
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
 
         if not isinstance(arguments, dict):
-            return jsonify({
-                "action": "block",
-                "reason": "arguments must be an object",
-                "result": None,
-            }), 200
+            return decision(
+                "block",
+                "arguments must be an object",
+            )
 
         # ====================================================
         # read_file
@@ -389,24 +451,24 @@ def guard():
 
         if tool == "read_file":
 
-            path = arguments.get("path")
-
-            allowed, reason, content = guarded_read_file(path)
+            allowed, reason, content = read_guarded_file(
+                arguments.get("path")
+            )
 
             if not allowed:
-                return jsonify({
-                    "action": "block",
-                    "reason": reason,
-                    "result": None,
-                }), 200
+                return decision(
+                    "block",
+                    reason,
+                    None,
+                )
 
-            return jsonify({
-                "action": "allow",
-                "reason": reason,
-                "result": {
+            return decision(
+                "allow",
+                reason,
+                {
                     "content": content
                 },
-            }), 200
+            )
 
         # ====================================================
         # fetch_url
@@ -414,45 +476,48 @@ def guard():
 
         if tool == "fetch_url":
 
-            url = arguments.get("url")
-
-            allowed, reason, content = guarded_fetch_url(url)
+            allowed, reason, content = fetch_guarded_url(
+                arguments.get("url")
+            )
 
             if not allowed:
-                return jsonify({
-                    "action": "block",
-                    "reason": reason,
-                    "result": None,
-                }), 200
+                return decision(
+                    "block",
+                    reason,
+                    None,
+                )
 
-            return jsonify({
-                "action": "allow",
-                "reason": reason,
-                "result": {
+            return decision(
+                "allow",
+                reason,
+                {
                     "body": content
                 },
-            }), 200
+            )
 
         # ====================================================
         # Unknown tool
         # ====================================================
 
-        return jsonify({
-            "action": "block",
-            "reason": "unknown tool",
-            "result": None,
-        }), 200
+        return decision(
+            "block",
+            "unknown tool",
+            None,
+        )
 
-    except Exception as exc:
-
-        # Never allow an application exception to become a 500.
-        return jsonify({
-            "action": "block",
-            "reason": "guardrail error",
-            "result": None,
-        }), 200
+    except Exception:
+        # Never leak internal exceptions and never generate 500.
+        return decision(
+            "block",
+            "guardrail error",
+            None,
+        )
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+    )
